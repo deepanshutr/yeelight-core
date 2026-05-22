@@ -1,0 +1,21 @@
+[Unit]
+Description=yeelight-core — Xiaomi Yeelight smart-bulb control daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/yeelight/state.env
+ExecStart=%h/.local/bin/yeelight-core serve
+Restart=on-failure
+RestartSec=5
+
+# Hardening (only flags that work in user-scope; see
+# feedback_systemd_user_hardening in user memory)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=%h/.config/yeelight
+
+[Install]
+WantedBy=default.target
