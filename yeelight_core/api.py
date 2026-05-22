@@ -9,6 +9,8 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from .driver import YeelightError
+from .onboard import OnboardDeps, OnboardResult
+from .onboard import run as run_onboard
 from .registry import Bulb, Registry
 from .scenes import SCENES, SceneAction, resolve_scene
 
@@ -53,6 +55,13 @@ class DiscoverIn(BaseModel):
     passive: bool = False
 
 
+class OnboardIn(BaseModel):
+    ssid: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=128)
+    setup_ssid: str | None = Field(None, max_length=64)
+    timeout_s: int = Field(60, ge=10, le=300)
+
+
 def _bulb_payload(b: Bulb) -> dict[str, Any]:
     return {
         "protocol": "yeelight",
@@ -86,6 +95,7 @@ def create_app(
     registry: Registry,
     driver: _Driver,
     run_discovery: Callable[[], Coroutine[Any, Any, int]],
+    onboard_deps: OnboardDeps | None = None,
 ) -> FastAPI:
     app = FastAPI(title="yeelight-core")
 
@@ -199,5 +209,62 @@ def create_app(
     @app.get("/scenes")
     async def scenes() -> dict[str, Any]:
         return {"scenes": [{"name": nm} for nm in sorted(SCENES)]}
+
+    @app.post("/onboard")
+    async def onboard_route(body: OnboardIn) -> dict[str, Any]:
+        if onboard_deps is None:
+            raise HTTPException(
+                status_code=501,
+                detail={
+                    "error": "yeelight_onboard_unconfigured",
+                    "message": (
+                        "onboarding deps were not wired into this app "
+                        "(nmcli/httpx/discover); start via the daemon, "
+                        "not a bare create_app()"
+                    ),
+                },
+            )
+        # Yeelight setup APs match yeelink-*; honour an explicit override.
+        setup_ssid = body.setup_ssid or "yeelink-light"
+        known = {b.mac for b in registry.all()}
+        result: OnboardResult = await run_onboard(
+            ssid=body.ssid,
+            password=body.password,
+            setup_ssid=setup_ssid,
+            timeout_s=body.timeout_s,
+            known_macs=known,
+            deps=onboard_deps,
+        )
+        if result.status == "ok":
+            # Fold any freshly-onboarded bulbs into the registry.
+            for entry in result.onboarded:
+                registry.upsert_discovered(
+                    {
+                        "mac": entry["mac"],
+                        "ip": entry["ip"],
+                        "port": 55443,
+                        "rssi": entry.get("rssi"),
+                    }
+                )
+            registry.flush()
+            return {"onboarded": result.onboarded}
+        if result.status == "timeout":
+            raise HTTPException(
+                status_code=408,
+                detail={
+                    "error": "timeout",
+                    "attempted_seconds": result.attempted_seconds,
+                },
+            )
+        if result.status == "validation":
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "validation", "message": result.error},
+            )
+        # status == "error"
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "yeelight_onboard_internal", "detail": result.error},
+        )
 
     return app
