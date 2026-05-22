@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 from collections.abc import Callable, Coroutine
 from typing import Annotated, Any, Protocol
 
@@ -96,6 +98,7 @@ def create_app(
     driver: _Driver,
     run_discovery: Callable[[], Coroutine[Any, Any, int]],
     onboard_deps: OnboardDeps | None = None,
+    all_concurrency: int = 16,
 ) -> FastAPI:
     app = FastAPI(title="yeelight-core")
 
@@ -129,6 +132,178 @@ def create_app(
         n = await run_discovery()
         registry.flush()
         return {"discovered": n, "total": len(registry.all())}
+
+    @app.get("/scenes")
+    async def scenes() -> dict[str, Any]:
+        return {"scenes": [{"name": nm} for nm in sorted(SCENES)]}
+
+    @app.post("/onboard")
+    async def onboard_route(body: OnboardIn) -> dict[str, Any]:
+        if onboard_deps is None:
+            raise HTTPException(
+                status_code=501,
+                detail={
+                    "error": "yeelight_onboard_unconfigured",
+                    "message": (
+                        "onboarding deps were not wired into this app "
+                        "(nmcli/httpx/discover); start via the daemon, "
+                        "not a bare create_app()"
+                    ),
+                },
+            )
+        # Yeelight setup APs match yeelink-*; honour an explicit override.
+        setup_ssid = body.setup_ssid or "yeelink-light"
+        known = {b.mac for b in registry.all()}
+        result: OnboardResult = await run_onboard(
+            ssid=body.ssid,
+            password=body.password,
+            setup_ssid=setup_ssid,
+            timeout_s=body.timeout_s,
+            known_macs=known,
+            deps=onboard_deps,
+        )
+        if result.status == "ok":
+            # Fold any freshly-onboarded bulbs into the registry.
+            for entry in result.onboarded:
+                registry.upsert_discovered(
+                    {
+                        "mac": entry["mac"],
+                        "ip": entry["ip"],
+                        "port": 55443,
+                        "rssi": entry.get("rssi"),
+                    }
+                )
+            registry.flush()
+            return {"onboarded": result.onboarded}
+        if result.status == "timeout":
+            raise HTTPException(
+                status_code=408,
+                detail={
+                    "error": "timeout",
+                    "attempted_seconds": result.attempted_seconds,
+                },
+            )
+        if result.status == "validation":
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "validation", "message": result.error},
+            )
+        # status == "error"
+        raise HTTPException(
+            status_code=500,
+            detail={"error": "yeelight_onboard_internal", "detail": result.error},
+        )
+
+    # ----- Broadcast family (/bulb/all/{op}) — §A2 -----
+    # IMPORTANT: these must be registered BEFORE /bulb/{target}/... routes
+    # because Starlette matches routes in registration order, and the literal
+    # segment "all" would otherwise be captured by the {target} path parameter.
+
+    async def _do_one_bulb(
+        b: Bulb, op: str, body: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Apply one op to one bulb; return a per-bulb result dict.
+
+        Never raises — any exception is folded into the result's `error`.
+        """
+        started = time.monotonic()
+        try:
+            if op == "on":
+                await driver.set_power(b.last_ip, b.port, on=True)
+            elif op == "off":
+                await driver.set_power(b.last_ip, b.port, on=False)
+            elif op == "brightness":
+                await driver.set_brightness(b.last_ip, b.port, int(body["level"]))
+            elif op == "temp":
+                await driver.set_temp(b.last_ip, b.port, int(body["kelvin"]))
+            elif op == "color":
+                await driver.set_color(
+                    b.last_ip, b.port,
+                    int(body["r"]), int(body["g"]), int(body["b"]),
+                )
+            elif op == "scene":
+                await _apply_scene(driver, b, resolve_scene(body["scene"]))
+            else:  # pragma: no cover - guarded by the registered route set
+                raise ValueError(f"unknown op {op!r}")
+        except Exception as exc:
+            return {
+                "mac": b.mac,
+                "ok": False,
+                "error": str(exc),
+                "duration_ms": int((time.monotonic() - started) * 1000),
+            }
+        return {
+            "mac": b.mac,
+            "ok": True,
+            "duration_ms": int((time.monotonic() - started) * 1000),
+        }
+
+    async def _broadcast(op: str, body: dict[str, Any]) -> dict[str, Any]:
+        """Fan `op` out to every registered bulb; always HTTP-200-shaped."""
+        bulbs = registry.all()
+        started = time.monotonic()
+        if not bulbs:
+            return {
+                "op": op, "total": 0, "ok": 0, "failed": 0,
+                "duration_ms": int((time.monotonic() - started) * 1000),
+                "results": [],
+            }
+        sem = asyncio.Semaphore(min(len(bulbs), max(1, all_concurrency)))
+
+        async def guarded(b: Bulb) -> dict[str, Any]:
+            async with sem:
+                return await _do_one_bulb(b, op, body)
+
+        results = await asyncio.gather(
+            *(guarded(b) for b in bulbs), return_exceptions=True
+        )
+        # gather(return_exceptions=True) can hand back an Exception if guarded
+        # itself failed before _do_one_bulb's try block — normalise those too.
+        norm: list[dict[str, Any]] = []
+        for b, res in zip(bulbs, results, strict=True):
+            if isinstance(res, dict):
+                norm.append(res)
+            else:
+                norm.append({
+                    "mac": b.mac, "ok": False,
+                    "error": repr(res), "duration_ms": 0,
+                })
+        ok = sum(1 for r in norm if r["ok"])
+        return {
+            "op": op,
+            "total": len(norm),
+            "ok": ok,
+            "failed": len(norm) - ok,
+            "duration_ms": int((time.monotonic() - started) * 1000),
+            "results": norm,
+        }
+
+    @app.post("/bulb/all/on")
+    async def all_on() -> dict[str, Any]:
+        return await _broadcast("on", {})
+
+    @app.post("/bulb/all/off")
+    async def all_off() -> dict[str, Any]:
+        return await _broadcast("off", {})
+
+    @app.post("/bulb/all/brightness")
+    async def all_brightness(body: BrightnessIn) -> dict[str, Any]:
+        return await _broadcast("brightness", {"level": body.level})
+
+    @app.post("/bulb/all/temp")
+    async def all_temp(body: TempIn) -> dict[str, Any]:
+        return await _broadcast("temp", {"kelvin": body.kelvin})
+
+    @app.post("/bulb/all/color")
+    async def all_color(body: ColorIn) -> dict[str, Any]:
+        return await _broadcast("color", {"r": body.r, "g": body.g, "b": body.b})
+
+    @app.post("/bulb/all/scene")
+    async def all_scene(body: SceneIn) -> dict[str, Any]:
+        return await _broadcast("scene", {"scene": body.scene})
+
+    # ----- Single-bulb routes (/bulb/{target}/...) -----
+    # Must be registered AFTER /bulb/all/* so the static "all" segment wins.
 
     @app.get("/bulb/{target}")
     async def get_bulb(target: str) -> dict[str, Any]:
@@ -205,66 +380,5 @@ def create_app(
         except YeelightError:
             pass
         return _bulb_payload(b)
-
-    @app.get("/scenes")
-    async def scenes() -> dict[str, Any]:
-        return {"scenes": [{"name": nm} for nm in sorted(SCENES)]}
-
-    @app.post("/onboard")
-    async def onboard_route(body: OnboardIn) -> dict[str, Any]:
-        if onboard_deps is None:
-            raise HTTPException(
-                status_code=501,
-                detail={
-                    "error": "yeelight_onboard_unconfigured",
-                    "message": (
-                        "onboarding deps were not wired into this app "
-                        "(nmcli/httpx/discover); start via the daemon, "
-                        "not a bare create_app()"
-                    ),
-                },
-            )
-        # Yeelight setup APs match yeelink-*; honour an explicit override.
-        setup_ssid = body.setup_ssid or "yeelink-light"
-        known = {b.mac for b in registry.all()}
-        result: OnboardResult = await run_onboard(
-            ssid=body.ssid,
-            password=body.password,
-            setup_ssid=setup_ssid,
-            timeout_s=body.timeout_s,
-            known_macs=known,
-            deps=onboard_deps,
-        )
-        if result.status == "ok":
-            # Fold any freshly-onboarded bulbs into the registry.
-            for entry in result.onboarded:
-                registry.upsert_discovered(
-                    {
-                        "mac": entry["mac"],
-                        "ip": entry["ip"],
-                        "port": 55443,
-                        "rssi": entry.get("rssi"),
-                    }
-                )
-            registry.flush()
-            return {"onboarded": result.onboarded}
-        if result.status == "timeout":
-            raise HTTPException(
-                status_code=408,
-                detail={
-                    "error": "timeout",
-                    "attempted_seconds": result.attempted_seconds,
-                },
-            )
-        if result.status == "validation":
-            raise HTTPException(
-                status_code=422,
-                detail={"error": "validation", "message": result.error},
-            )
-        # status == "error"
-        raise HTTPException(
-            status_code=500,
-            detail={"error": "yeelight_onboard_internal", "detail": result.error},
-        )
 
     return app
