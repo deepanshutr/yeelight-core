@@ -19,12 +19,12 @@ log = logging.getLogger(__name__)
 # third-party control protocol spec). MAN must be the quoted discover verb;
 # ST must be "wifi_bulb".
 _MSEARCH_PAYLOAD = (
-    "M-SEARCH * HTTP/1.1\r\n"
-    "HOST: 239.255.255.250:1982\r\n"
-    'MAN: "ssdp:discover"\r\n'
-    "ST: wifi_bulb\r\n"
-    "\r\n"
-).encode()
+    b"M-SEARCH * HTTP/1.1\r\n"
+    b"HOST: 239.255.255.250:1982\r\n"
+    b'MAN: "ssdp:discover"\r\n'
+    b"ST: wifi_bulb\r\n"
+    b"\r\n"
+)
 
 
 def _normalise_mac(s: str) -> str:
